@@ -1,10 +1,13 @@
+import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
 import { RoomServiceClient, AccessToken } from "livekit-server-sdk";
 
 dotenv.config();
 
+
 const app = express();
+app.use(cors());
 app.use(express.json());
 
 // LiveKit config (must be defined before use)
