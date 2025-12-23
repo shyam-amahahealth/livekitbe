@@ -1,117 +1,158 @@
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
-import { RoomServiceClient, AccessToken } from "livekit-server-sdk";
+import {
+  RoomServiceClient,
+  AccessToken,
+  EgressClient,
+} from "livekit-server-sdk";
 
 dotenv.config();
 
-
+/* ──────────────────────────────
+   Basic setup
+────────────────────────────── */
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// LiveKit config (must be defined before use)
-const livekitHost = process.env.LIVEKIT_HOST;
-const livekitApiKey = process.env.LIVEKIT_API_KEY;
-const livekitApiSecret = process.env.LIVEKIT_API_SECRET;
 const PORT = process.env.PORT || 5001;
+const LIVEKIT_HOST = process.env.LIVEKIT_HOST;
+const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY;
+const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET;
 
+console.log("🔧 LiveKit Config");
+console.log("HOST:", LIVEKIT_HOST);
+console.log("KEY:", LIVEKIT_API_KEY);
+console.log("SECRET SET:", !!LIVEKIT_API_SECRET);
+
+/* ──────────────────────────────
+   LiveKit client
+────────────────────────────── */
 const roomService = new RoomServiceClient(
-  livekitHost,
-  livekitApiKey,
-  livekitApiSecret
+  LIVEKIT_HOST,
+  LIVEKIT_API_KEY,
+  LIVEKIT_API_SECRET
 );
 
+const egressClient = new EgressClient(
+  LIVEKIT_HOST,
+  LIVEKIT_API_KEY,
+  LIVEKIT_API_SECRET
+);
+
+/* ──────────────────────────────
+   In-memory room host tracking
+────────────────────────────── */
+const roomHosts = {};
+
+/* ──────────────────────────────
+   Routes
+────────────────────────────── */
+
+// Health check
 app.get("/", (req, res) => {
-  res.send("LiveKit backend is running");
+  console.log("➡️  GET /");
+  res.send("LiveKit backend running");
 });
 
-// Endpoint to create a room
+/* ────────────────
+   Create room
+──────────────── */
 app.post("/room", async (req, res) => {
   const { name } = req.body;
-  if (!name) {
-    return res.status(400).json({ error: "Room name is required" });
-  }
+  console.log("➡️  POST /room", name);
+
+  if (!name) return res.status(400).json({ error: "room name required" });
+
   try {
     const room = await roomService.createRoom({ name });
+    console.log("✅ Room created:", room.name);
     res.json(room);
   } catch (err) {
+    console.error("❌ createRoom failed:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-
-// In-memory map to track room hosts (for demo; use persistent store in production)
-const roomHosts = {};
-
-// Helper to wait for room deletion
-async function waitForRoomDeletion(room, maxTries = 10, delayMs = 500) {
-  for (let i = 0; i < maxTries; i++) {
-    const rooms = await roomService.listRooms([room]);
-    if (rooms.length === 0) return true;
-    await new Promise(r => setTimeout(r, delayMs));
-  }
-  return false;
-}
-// Endpoint for host to end the room (disconnect all)
-app.post("/end-room", async (req, res) => {
+/* ────────────────
+   Token
+──────────────── */
+app.post("/token", async (req, res) => {
   const { room, identity } = req.body;
+  console.log("➡️  POST /token", room, identity);
+
   if (!room || !identity) {
     return res.status(400).json({ error: "room and identity required" });
   }
-  // Only host can end the room
-  if (roomHosts[room] !== identity) {
-    return res.status(403).json({ error: "Only host can end the room" });
-  }
-  try {
-    // End the room via LiveKit API
-    await roomService.deleteRoom(room);
-    // Remove host info
-    delete roomHosts[room];
-    // Wait for room to be deleted in LiveKit
-    await waitForRoomDeletion(room);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
-// Endpoint to generate a LiveKit token with role
-app.post("/token", async (req, res) => {
-  const { room, identity } = req.body;
-  console.log("--- /token request received ---");
-  console.log("Room:", room);
-  console.log("Identity:", identity);
-  if (!room || !identity) {
-    console.log("Missing room or identity");
-    return res.status(400).json({ error: "room and identity are required" });
-  }
   let role = "participant";
+
+  if (!roomHosts[room]) {
+    roomHosts[room] = identity;
+    role = "host";
+    console.log("👑 Host assigned:", identity);
+  } else if (roomHosts[room] === identity) {
+    role = "host";
+  }
+
   try {
-    // Check if room exists and if host is set
-    if (!roomHosts[room]) {
-      // First user to request token for this room is host
-      roomHosts[room] = identity;
-      role = "host";
-    } else if (roomHosts[room] === identity) {
-      role = "host";
-    }
-    const at = new AccessToken(livekitApiKey, livekitApiSecret, {
+    const accessToken = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
       identity,
     });
-    at.addGrant({ roomJoin: true, room });
-    // Add custom claim for role
-    at.metadata = JSON.stringify({ role });
-    const token = at.toJwt();
-    console.log("Generated token for", identity, "role:", role);
-    res.json({ token, role });
+    accessToken.addGrant({ roomJoin: true, room });
+    accessToken.metadata = JSON.stringify({ role });
+    const jwt = await accessToken.toJwt();
+    console.log("🎟️ Token issued:", identity, role, jwt);
+    res.json({ token: jwt, role });
   } catch (err) {
-    console.error("Token generation error:", err);
+    console.error("❌ token error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Endpoint to check if a room exists (for polling by clients)
+/* ────────────────
+   Start egress (CHUNKED RECORDING)
+──────────────── */
+app.post("/start-egress", async (req, res) => {
+  const { room, filename } = req.body;
+
+  console.log("➡️  POST /start-egress", room, filename);
+
+  if (!room || !filename) {
+    return res.status(400).json({
+      error: "room and filename required",
+    });
+  }
+
+  try {
+    console.log("🎥 Starting room composite egress (video chunks, mp4)...");
+
+    const info = await egressClient.startRoomCompositeEgress(
+      room,
+      {
+        segments: {
+          filenamePrefix: `/out/${filename}`,
+          segmentDuration: 10, // 10 seconds per chunk
+        },
+      },
+      {
+        layout: "grid",
+      }
+    );
+    console.log("✅ Egress started:", info.egressId);
+
+    res.json({
+      egressId: info.egressId,
+      status: info.status,
+    });
+  } catch (err) {
+    console.error("❌ start-egress failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Endpoint to check if a room exists
 app.post("/room-exists", async (req, res) => {
   const { room } = req.body;
   if (!room) return res.json({ exists: false });
@@ -119,13 +160,59 @@ app.post("/room-exists", async (req, res) => {
     const rooms = await roomService.listRooms([room]);
     res.json({ exists: rooms.length > 0 });
   } catch (err) {
+    console.error("room-exists error:", err);
     res.json({ exists: false });
   }
 });
 
+/* ────────────────
+   Stop egress
+──────────────── */
+app.post("/stop-egress", async (req, res) => {
+  const { egressId } = req.body;
+
+  console.log("➡️  POST /stop-egress", egressId);
+
+  if (!egressId) {
+    return res.status(400).json({ error: "egressId required" });
+  }
+
+  try {
+    const info = await egressClient.stopEgress(egressId);
+    console.log("🛑 Egress stopped:", egressId);
+    res.json(info);
+  } catch (err) {
+    console.error("❌ stop-egress failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ────────────────
+   End room
+──────────────── */
+app.post("/end-room", async (req, res) => {
+  const { room, identity } = req.body;
+  console.log("➡️  POST /end-room", room, identity);
+
+  if (!room) {
+    return res.status(400).json({ error: "room required" });
+  }
+
+  try {
+    await roomService.deleteRoom(room);
+
+    if (roomHosts[room]) delete roomHosts[room];
+
+    res.json({ status: "room-ended" });
+  } catch (err) {
+    console.error("❌ end-room failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ──────────────────────────────
+   Start server
+────────────────────────────── */
 app.listen(PORT, () => {
-  console.log(`LiveKit backend listening on port ${PORT}`);
-  console.log("LIVEKIT_HOST:", livekitHost);
-  console.log("LIVEKIT_API_KEY:", livekitApiKey);
-  // Do not log secret in production!
+  console.log(`🚀 Server listening on port ${PORT}`);
 });
